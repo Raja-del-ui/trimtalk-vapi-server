@@ -50,6 +50,24 @@ function initializeFirebase() {
 // Initialize Firebase on startup
 initializeFirebase();
 
+// Helper: Convert HH:MM to minutes since midnight
+function timeToMinutes(timeStr) {
+  const [hours, minutes] = timeStr.split(':').map(Number);
+  return hours * 60 + minutes;
+}
+
+// Helper: Convert minutes to HH:MM format
+function minutesToTime(minutes) {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
+}
+
+// Helper: Check if two time ranges overlap
+function hasOverlap(start1, end1, start2, end2) {
+  return start1 < end2 && end1 > start2;
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -59,7 +77,7 @@ app.get('/health', (req, res) => {
 app.post('/api/vapi-book', async (req, res) => {
   try {
     // Extract data from Vapi webhook
-    const { customerName, phoneNumber, service, date, time } = req.body;
+    const { customerName, phoneNumber, service, date, time, staffId } = req.body;
 
     // Validate required fields
     if (!customerName || !phoneNumber || !service || !date || !time) {
@@ -82,18 +100,88 @@ app.post('/api/vapi-book', async (req, res) => {
       });
     }
 
-    // Create appointment document
+    // 1. Fetch the real service duration from Firestore
+    let duration = 30; // default fallback
+    try {
+      const servicesSnap = await db.collection('services')
+        .where('name', '==', service.trim())
+        .limit(1)
+        .get();
+      
+      if (!servicesSnap.empty) {
+        const serviceDoc = servicesSnap.docs[0].data();
+        if (serviceDoc.duration && typeof serviceDoc.duration === 'number') {
+          duration = serviceDoc.duration;
+        } else if (serviceDoc.duration && typeof serviceDoc.duration === 'string') {
+          // Handle "30 min" format
+          const parsed = parseInt(serviceDoc.duration.replace(/\D/g, ''), 10);
+          if (!isNaN(parsed)) duration = parsed;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not fetch service duration, using default 30:', e);
+    }
+
+    // 2. Calculate end time
+    const startMinutes = timeToMinutes(time);
+    const endMinutes = startMinutes + duration;
+    const endTime = minutesToTime(endMinutes);
+
+    // 3. Check for conflicts with existing appointments
+    // We need staffId to check conflicts for the specific staff member
+    // If staffId not provided, check all appointments for that date/time
+    let conflictQuery = db.collection('appointments')
+      .where('date', '==', date)
+      .where('status', 'in', ['Pending', 'Confirmed', 'Completed']);
+    
+    if (staffId) {
+      conflictQuery = conflictQuery.where('staffId', '==', staffId);
+    }
+
+    const existingAppointmentsSnap = await conflictQuery.get();
+    
+    let hasConflict = false;
+    let conflictingAppointment = null;
+
+    for (const doc of existingAppointmentsSnap.docs) {
+      const existing = doc.data();
+      const existingStart = timeToMinutes(existing.time);
+      const existingDuration = existing.duration || 30;
+      const existingEnd = existingStart + existingDuration;
+
+      if (hasOverlap(startMinutes, endMinutes, existingStart, existingEnd)) {
+        hasConflict = true;
+        conflictingAppointment = existing;
+        break;
+      }
+    }
+
+    if (hasConflict) {
+      console.log('Conflict detected:', conflictingAppointment);
+      return res.status(200).json({
+        result: 'Error: This time slot is already booked for the requested duration. Please ask the customer for another time.'
+      });
+    }
+
+    // 4. No conflict - save the appointment
     const appointmentData = {
       customerName: customerName.trim(),
       phoneNumber: phoneNumber.trim(),
       service: service.trim(),
       date: date,
       time: time,
+      endTime: endTime,
+      duration: duration,
       status: 'Pending',
       createdByAI: true,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
+
+    // Add staffId if provided
+    if (staffId) {
+      appointmentData.staffId = staffId;
+    }
 
     // Write to Firestore
     const docRef = await db.collection('appointments').add(appointmentData);
